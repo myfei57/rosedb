@@ -12,4 +12,10 @@ var (
 	ErrDBClosed        = errors.New("the database is closed")
 	ErrMergeRunning    = errors.New("the merge operation is running")
 	ErrWatchDisabled   = errors.New("the watch is disabled")
+
+	ErrBackupPathConflict   = errors.New("the backup path must not be the database directory, inside it, or contain it")
+	ErrBackupTargetNotEmpty = errors.New("the backup target directory is not empty")
+	ErrBackupTargetNotDir   = errors.New("the backup target path exists but is not a directory")
+	ErrBackupParentMissing  = errors.New("the parent directory of the backup target path does not exist")
+	ErrBackupIncomplete     = errors.New("the backup is incomplete")
 )

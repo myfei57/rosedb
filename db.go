@@ -56,6 +56,23 @@ type DB struct {
 	watcher          *Watcher
 	expiredCursorKey []byte     // the location to which DeleteExpiredKeys executes.
 	cronScheduler    *cron.Cron // cron scheduler for auto merge task
+
+	// backupMu is a generation lease for online backups.
+	//
+	// An in-flight backup holds backupMu in RLock mode after its consistency
+	// boundary is captured, so the destructive file replacement done by
+	// Merge(true) and the file closing done by Close cannot remove or close
+	// the files the backup is still copying.
+	//
+	// The lock order is always: db.mu -> backupMu, never the reverse.
+	backupMu sync.RWMutex
+	// backupPublishMu serializes backups of the same DB instance, so the
+	// "target does not exist or is empty" rule and the atomic publish cannot
+	// race between two backups writing to the same target.
+	backupPublishMu sync.Mutex
+	// activeBackups is the number of in-flight backups, mainly for tests and
+	// diagnostics. It is accessed atomically.
+	activeBackups int64
 }
 
 // Stat represents the statistics of the database.
@@ -196,6 +213,12 @@ func (db *DB) Close() error {
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
+
+	// Wait for in-flight backups to finish, so the files they are still
+	// copying are not closed or removed underneath them. A backup releases its
+	// lease when it completes, fails, or is canceled.
+	db.backupMu.Lock()
+	defer db.backupMu.Unlock()
 
 	if err := db.closeFiles(); err != nil {
 		return err

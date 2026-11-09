@@ -40,6 +40,13 @@ func (db *DB) Merge(reopenAfterDone bool) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Wait for in-flight backups to release their generation leases.
+	// loadMergeFiles below deletes the old segment files and replaces the
+	// hint/merge-finished files, which must not happen while a backup is
+	// still copying that exact generation.
+	db.backupMu.Lock()
+	defer db.backupMu.Unlock()
+
 	// close current files
 	_ = db.closeFiles()
 
