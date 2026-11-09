@@ -1,6 +1,7 @@
 package rosedb
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -650,6 +651,46 @@ func (db *DB) checkValue(chunk []byte) []byte {
 	return nil
 }
 
+// deleteIndexRange removes every index key inside the half-open interval
+// [startKey, endKey) and returns the removed keys. A nil boundary together
+// with the matching unbounded flag represents infinity; a non-nil empty
+// boundary is treated as the smallest finite key.
+//
+// Keys are collected first and deleted afterwards so that the btree
+// traversal is never mutated while running. Only actually present keys are
+// visited, and this in-memory work never produces extra wal writes.
+func (db *DB) deleteIndexRange(startKey, endKey []byte, startUnbounded, endUnbounded bool) [][]byte {
+	var keys [][]byte
+	collect := func(key []byte, _ *wal.ChunkPosition) (bool, error) {
+		keys = append(keys, key)
+		return true, nil
+	}
+
+	switch {
+	case startUnbounded && endUnbounded:
+		db.index.Ascend(collect)
+	case startUnbounded:
+		db.index.Ascend(func(key []byte, pos *wal.ChunkPosition) (bool, error) {
+			// the interval is [negative infinity, endKey), stop at endKey.
+			if bytes.Compare(key, endKey) >= 0 {
+				return false, nil
+			}
+			keys = append(keys, key)
+			return true, nil
+		})
+	case endUnbounded:
+		db.index.AscendGreaterOrEqual(startKey, collect)
+	default:
+		// btree AscendRange already covers [startKey, endKey).
+		db.index.AscendRange(startKey, endKey, collect)
+	}
+
+	for _, key := range keys {
+		db.index.Delete(key)
+	}
+	return keys
+}
+
 func checkOptions(options Options) error {
 	if options.DirPath == "" {
 		return errors.New("database dir path is empty")
@@ -697,22 +738,48 @@ func (db *DB) loadIndexFromWAL() error {
 			}
 			return err
 		}
+
+		// range-delete markers need strict validation and must stay buffered
+		// until the matching batch finishes; an unfinished batch must never
+		// remove previously committed data.
+		if chunk[0] == LogRecordRangeDeleted {
+			rangeRecord, err := decodeRangeDeleteRecord(chunk)
+			if err != nil {
+				return err
+			}
+			indexRecords[rangeRecord.BatchId] = append(indexRecords[rangeRecord.BatchId],
+				&IndexRecord{
+					key:            rangeRecord.Key,
+					endKey:         rangeRecord.Value,
+					recordType:     LogRecordRangeDeleted,
+					position:       position,
+					startUnbounded: rangeRecord.StartUnbounded(),
+					endUnbounded:   rangeRecord.EndUnbounded(),
+				})
+			continue
+		}
+
 		// decode and get log record
 		record := decodeLogRecord(chunk)
 
 		// if we get the end of a batch,
 		// all records in this batch are ready to be indexed.
+		// they are replayed in the exact in-batch operation order, including
+		// range markers interleaved with point records.
 		if record.Type == LogRecordBatchFinished {
 			batchId, err := snowflake.ParseBytes(record.Key)
 			if err != nil {
 				return err
 			}
 			for _, idxRecord := range indexRecords[uint64(batchId)] {
-				if idxRecord.recordType == LogRecordNormal {
+				switch idxRecord.recordType {
+				case LogRecordNormal:
 					db.index.Put(idxRecord.key, idxRecord.position)
-				}
-				if idxRecord.recordType == LogRecordDeleted {
+				case LogRecordDeleted:
 					db.index.Delete(idxRecord.key)
+				case LogRecordRangeDeleted:
+					db.deleteIndexRange(idxRecord.key, idxRecord.endKey,
+						idxRecord.startUnbounded, idxRecord.endUnbounded)
 				}
 			}
 			// delete indexRecords according to batchId after indexing

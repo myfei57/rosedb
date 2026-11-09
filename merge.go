@@ -125,9 +125,24 @@ func (db *DB) doMerge() error {
 			return err
 		}
 		record := decodeLogRecord(chunk)
-		// Only handle the normal log record, LogRecordDeleted and LogRecordBatchFinished
-		// will be ignored, because they are not valid data.
-		if record.Type == LogRecordNormal && (record.Expire == 0 || record.Expire > now) {
+		// Point tombstones, batch-finished control records and range-delete
+		// markers are never valid data and are not copied.
+		//
+		// A range marker is safe to drop here because:
+		//   1. merge only reads segments up to prevActiveSegId, all of which
+		//      are atomically replaced by the merge output once it completes;
+		//   2. every key covered by a marker was already removed from the live
+		//      index at commit time, so the historical values below are not
+		//      index-live and will not be rewritten;
+		//   3. any same-key write that happened after the marker points to a
+		//      newer position (often in a segment not even scanned here), so it
+		//      is neither revived nor removed by the marker being dropped.
+		// Until the replacement is committed, the original files remain
+		// untouched, so an interrupted merge keeps all markers in place.
+		if record.Type != LogRecordNormal {
+			continue
+		}
+		if record.Expire == 0 || record.Expire > now {
 			db.mu.RLock()
 			indexPos := db.index.Get(record.Key)
 			db.mu.RUnlock()
