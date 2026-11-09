@@ -120,7 +120,7 @@ func (b *Batch) Put(key, value []byte) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
 	}
-	if b.db.closed {
+	if b.db.isClosed() {
 		return ErrDBClosed
 	}
 	if b.options.ReadOnly {
@@ -149,7 +149,7 @@ func (b *Batch) PutWithTTL(key, value []byte, ttl time.Duration) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
 	}
-	if b.db.closed {
+	if b.db.isClosed() {
 		return ErrDBClosed
 	}
 	if b.options.ReadOnly {
@@ -178,7 +178,7 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, ErrKeyIsEmpty
 	}
-	if b.db.closed {
+	if b.db.isClosed() {
 		return nil, ErrDBClosed
 	}
 
@@ -223,7 +223,7 @@ func (b *Batch) Delete(key []byte) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
 	}
-	if b.db.closed {
+	if b.db.isClosed() {
 		return ErrDBClosed
 	}
 	if b.options.ReadOnly {
@@ -257,7 +257,7 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 	if len(key) == 0 {
 		return false, ErrKeyIsEmpty
 	}
-	if b.db.closed {
+	if b.db.isClosed() {
 		return false, ErrDBClosed
 	}
 
@@ -296,7 +296,7 @@ func (b *Batch) Expire(key []byte, ttl time.Duration) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
 	}
-	if b.db.closed {
+	if b.db.isClosed() {
 		return ErrDBClosed
 	}
 	if b.options.ReadOnly {
@@ -348,7 +348,7 @@ func (b *Batch) TTL(key []byte) (time.Duration, error) {
 	if len(key) == 0 {
 		return -1, ErrKeyIsEmpty
 	}
-	if b.db.closed {
+	if b.db.isClosed() {
 		return -1, ErrDBClosed
 	}
 
@@ -402,7 +402,7 @@ func (b *Batch) Persist(key []byte) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
 	}
-	if b.db.closed {
+	if b.db.isClosed() {
 		return ErrDBClosed
 	}
 	if b.options.ReadOnly {
@@ -459,7 +459,7 @@ func (b *Batch) Persist(key []byte) error {
 // Finally, it will write the index.
 func (b *Batch) Commit() error {
 	defer b.unlock()
-	if b.db.closed {
+	if b.db.isClosed() {
 		return ErrDBClosed
 	}
 
@@ -515,13 +515,21 @@ func (b *Batch) Commit() error {
 		}
 	}
 
-	// write to index
+	// write to index, and collect the logical outcomes for OCC versioning.
+	writes := make([]committedWrite, 0, len(b.pendingWrites))
 	for i, record := range b.pendingWrites {
-		if record.Type == LogRecordDeleted || record.IsExpired(now) {
-			b.db.index.Delete(record.Key)
-		} else {
+		visible := record.Type != LogRecordDeleted && !record.IsExpired(now)
+		if visible {
 			b.db.index.Put(record.Key, chunkPositions[i])
+		} else {
+			b.db.index.Delete(record.Key)
 		}
+		// the key string is copied: the record goes back to the pool below.
+		writes = append(writes, committedWrite{
+			key:    string(record.Key),
+			exists: visible,
+			expire: record.Expire,
+		})
 
 		if b.db.options.WatchQueueSize > 0 {
 			e := &Event{Key: record.Key, Value: record.Value, BatchId: record.BatchId}
@@ -536,6 +544,13 @@ func (b *Batch) Commit() error {
 		b.db.recordPool.Put(record)
 	}
 
+	// Advance logical versions exactly once for this successful commit so
+	// that old-style batch writes participate in optimistic conflict
+	// validation. Merge never reaches this path, so it cannot bump versions.
+	b.db.occ.mu.Lock()
+	b.db.occ.publish(writes)
+	b.db.occ.mu.Unlock()
+
 	b.committed = true
 	return nil
 }
@@ -545,7 +560,7 @@ func (b *Batch) Commit() error {
 func (b *Batch) Rollback() error {
 	defer b.unlock()
 
-	if b.db.closed {
+	if b.db.isClosed() {
 		return ErrDBClosed
 	}
 

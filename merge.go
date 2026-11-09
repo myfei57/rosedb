@@ -67,7 +67,7 @@ func (db *DB) Merge(reopenAfterDone bool) error {
 func (db *DB) doMerge() error {
 	db.mu.Lock()
 	// check if the database is closed
-	if db.closed {
+	if db.isClosed() {
 		db.mu.Unlock()
 		return ErrDBClosed
 	}

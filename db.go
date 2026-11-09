@@ -47,7 +47,7 @@ type DB struct {
 	options          Options
 	fileLock         *flock.Flock
 	mu               sync.RWMutex
-	closed           bool
+	closed           uint32 // 1 if the database is closed, access atomically via isClosed
 	mergeRunning     uint32 // indicate if the database is merging
 	batchPool        sync.Pool
 	recordPool       sync.Pool
@@ -56,6 +56,18 @@ type DB struct {
 	watcher          *Watcher
 	expiredCursorKey []byte     // the location to which DeleteExpiredKeys executes.
 	cronScheduler    *cron.Cron // cron scheduler for auto merge task
+	occ              *occController
+	instanceID       uint64 // unique identity of this open instance, regenerated on every Open
+}
+
+// dbInstanceSeq hands out unique in-process instance identities. An
+// OptimisticBatch captures the identity of its creating instance and refuses
+// to commit against any other instance (including a reopened database).
+var dbInstanceSeq atomic.Uint64
+
+// isClosed reports whether the database has been closed.
+func (db *DB) isClosed() bool {
+	return atomic.LoadUint32(&db.closed) == 1
 }
 
 // Stat represents the statistics of the database.
@@ -110,6 +122,8 @@ func Open(options Options) (*DB, error) {
 		batchPool:    sync.Pool{New: newBatch},
 		recordPool:   sync.Pool{New: newRecord},
 		encodeHeader: make([]byte, maxLogRecordHeaderSize),
+		occ:          newOccController(),
+		instanceID:   dbInstanceSeq.Add(1),
 	}
 
 	// open data files
@@ -197,6 +211,10 @@ func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// mark closed first so racing batches fail fast instead of touching
+	// files that are about to be closed.
+	atomic.StoreUint32(&db.closed, 1)
+
 	if err := db.closeFiles(); err != nil {
 		return err
 	}
@@ -212,7 +230,6 @@ func (db *DB) Close() error {
 		close(db.watchCh)
 	}
 
-	db.closed = true
 	return nil
 }
 
