@@ -514,3 +514,574 @@ func TestBatch_Commit_SyncOption(t *testing.T) {
 		})
 	}
 }
+
+func reopenDB(t *testing.T, options Options, db *DB) *DB {
+	t.Helper()
+	assert.NoError(t, db.Close())
+	db2, err := Open(options)
+	assert.NoError(t, err)
+	return db2
+}
+
+func TestBatch_Savepoint_NestedRollback(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	batch := db.NewBatch(DefaultBatchOptions)
+	sp0, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("a"), []byte("1")))
+
+	sp1, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("b"), []byte("2")))
+
+	sp2, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("c"), []byte("3")))
+
+	// rollback to sp1 restores the state when sp1 was created: only "a" survives
+	assert.NoError(t, batch.RollbackTo(sp1))
+	assert.Len(t, batch.pendingWrites, 1)
+	val, err := batch.Get([]byte("a"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("1"), val)
+	for _, key := range []string{"b", "c"} {
+		_, err = batch.Get([]byte(key))
+		assert.Equal(t, ErrKeyNotFound, err, key)
+	}
+	// the younger savepoint is invalidated, while the target is retained
+	assert.Equal(t, ErrInvalidSavepoint, batch.RollbackTo(sp2))
+	assert.NoError(t, batch.RollbackTo(sp1))
+
+	// the same batch keeps working and an outer rollback removes everything
+	assert.NoError(t, batch.Put([]byte("d"), []byte("4")))
+	assert.NoError(t, batch.RollbackTo(sp0))
+	assert.Len(t, batch.pendingWrites, 0)
+	assert.Len(t, batch.undoRefCount, 0)
+	for _, key := range []string{"a", "b", "c", "d"} {
+		_, err = batch.Get([]byte(key))
+		assert.Equal(t, ErrKeyNotFound, err, key)
+	}
+	assert.NoError(t, batch.Commit())
+
+	db2 := reopenDB(t, options, db)
+	defer destroyDB(db2)
+	assertKeyExistOrNot(t, db2, []byte("a"), false)
+	assertKeyExistOrNot(t, db2, []byte("d"), false)
+}
+
+func TestBatch_Savepoint_ReleaseInnerThenRollbackOuter(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	batch := db.NewBatch(DefaultBatchOptions)
+	sp0, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("a"), []byte("1")))
+
+	sp1, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("b"), []byte("2")))
+
+	// releasing the inner savepoint accepts its changes and invalidates the token
+	assert.NoError(t, batch.ReleaseSavepoint(sp1))
+	assert.Equal(t, ErrInvalidSavepoint, batch.ReleaseSavepoint(sp1))
+	val, err := batch.Get([]byte("b"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("2"), val)
+
+	// the outer savepoint can still undo the accepted changes
+	assert.NoError(t, batch.RollbackTo(sp0))
+	assert.Len(t, batch.pendingWrites, 0)
+	for _, key := range []string{"a", "b"} {
+		_, err = batch.Get([]byte(key))
+		assert.Equal(t, ErrKeyNotFound, err, key)
+	}
+
+	// rebuild on the same batch and commit the remaining changes
+	assert.NoError(t, batch.Put([]byte("a"), []byte("10")))
+	assert.NoError(t, batch.Commit())
+
+	db2 := reopenDB(t, options, db)
+	defer destroyDB(db2)
+	assertKeyExistOrNot(t, db2, []byte("a"), true)
+	assertKeyExistOrNot(t, db2, []byte("b"), false)
+}
+
+func TestBatch_Savepoint_SameKeyOverwrite(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	batch := db.NewBatch(DefaultBatchOptions)
+	sp0, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("k"), []byte("v1")))
+
+	sp1, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("k"), []byte("v2")))
+	assert.NoError(t, batch.Put([]byte("k"), []byte("v3")))
+	assert.NoError(t, batch.Delete([]byte("k")))
+	assert.NoError(t, batch.Put([]byte("k"), []byte("v4")))
+
+	// repeated in-place overwrites inside one scope all converge on the first image
+	assert.NoError(t, batch.RollbackTo(sp1))
+	val, err := batch.Get([]byte("k"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("v1"), val)
+	assert.Len(t, batch.pendingWrites, 1)
+
+	// rolling back further removes the first-time append as well
+	assert.NoError(t, batch.RollbackTo(sp0))
+	_, err = batch.Get([]byte("k"))
+	assert.Equal(t, ErrKeyNotFound, err)
+	assert.Len(t, batch.pendingWrites, 0)
+
+	// rewrite after rollback and commit
+	assert.NoError(t, batch.Put([]byte("k"), []byte("final")))
+	assert.NoError(t, batch.Commit())
+
+	db2 := reopenDB(t, options, db)
+	defer destroyDB(db2)
+	val, err = db2.Get([]byte("k"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("final"), val)
+}
+
+func TestBatch_Savepoint_HashCollision(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	batch := db.NewBatch(DefaultBatchOptions)
+	sp0, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("collide-1"), []byte("v1")))
+
+	sp1, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("collide-2"), []byte("v2")))
+
+	// MemHash collisions cannot be forged deterministically, so simulate the
+	// exact bucket state a real collision would produce: register the second
+	// record in the first record's hash bucket and keep the undo entry in sync.
+	h1 := utils.MemHash([]byte("collide-1"))
+	h2 := utils.MemHash([]byte("collide-2"))
+	idx2 := len(batch.pendingWrites) - 1
+	assert.Equal(t, []int{idx2}, batch.pendingWritesMap[h2])
+	batch.pendingWritesMap[h1] = append(batch.pendingWritesMap[h1], idx2)
+	delete(batch.pendingWritesMap, h2)
+	for _, entry := range batch.savepoints[1].undo {
+		if !entry.existed {
+			entry.hashKey = h1
+		}
+	}
+
+	assert.NoError(t, batch.RollbackTo(sp1))
+
+	// the removed record's collision slot is gone and the survivor's slot is intact
+	assert.Len(t, batch.pendingWrites, 1)
+	assert.Equal(t, []int{0}, batch.pendingWritesMap[h1])
+	_, ok := batch.pendingWritesMap[h2]
+	assert.False(t, ok)
+	val, err := batch.Get([]byte("collide-1"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("v1"), val)
+	_, err = batch.Get([]byte("collide-2"))
+	assert.Equal(t, ErrKeyNotFound, err)
+
+	assert.NoError(t, batch.RollbackTo(sp0))
+	assert.Len(t, batch.pendingWrites, 0)
+	assert.NoError(t, batch.Commit())
+}
+
+func TestBatch_Savepoint_TTLChange(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	assert.NoError(t, db.PutWithTTL([]byte("ttl-key"), []byte("v"), time.Hour))
+	assert.NoError(t, db.Put([]byte("plain"), []byte("p")))
+
+	batch := db.NewBatch(DefaultBatchOptions)
+	sp0, err := batch.Savepoint()
+	assert.NoError(t, err)
+	// Expire on a key absent from pendingWrites reads the wal and appends a record
+	assert.NoError(t, batch.Expire([]byte("ttl-key"), 2*time.Hour))
+
+	sp1, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Expire([]byte("ttl-key"), time.Minute))
+	ttl, err := batch.TTL([]byte("ttl-key"))
+	assert.NoError(t, err)
+	assert.True(t, ttl <= time.Minute)
+
+	// rollback restores the 2h expiry captured by sp1
+	assert.NoError(t, batch.RollbackTo(sp1))
+	ttl, err = batch.TTL([]byte("ttl-key"))
+	assert.NoError(t, err)
+	assert.True(t, ttl > time.Hour)
+
+	// rolling back the wal-read append returns to the original wal state
+	assert.NoError(t, batch.RollbackTo(sp0))
+	ttl, err = batch.TTL([]byte("ttl-key"))
+	assert.NoError(t, err)
+	assert.True(t, ttl > time.Minute && ttl <= time.Hour)
+
+	// Persist appends a wal-derived record too and is undone the same way
+	sp2, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Persist([]byte("ttl-key")))
+	ttl, err = batch.TTL([]byte("ttl-key"))
+	assert.NoError(t, err)
+	assert.Equal(t, time.Duration(-1), ttl)
+	assert.NoError(t, batch.RollbackTo(sp2))
+	ttl, err = batch.TTL([]byte("ttl-key"))
+	assert.NoError(t, err)
+	assert.True(t, ttl > 0)
+
+	// an in-place PutWithTTL overwrite of a pending record restores value and expire
+	assert.NoError(t, batch.Put([]byte("local"), []byte("lv")))
+	sp3, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.PutWithTTL([]byte("local"), []byte("tt"), time.Minute))
+	ttl, err = batch.TTL([]byte("local"))
+	assert.NoError(t, err)
+	assert.True(t, ttl > 0 && ttl <= time.Minute)
+	assert.NoError(t, batch.RollbackTo(sp3))
+	val, err := batch.Get([]byte("local"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("lv"), val)
+	ttl, err = batch.TTL([]byte("local"))
+	assert.NoError(t, err)
+	assert.Equal(t, time.Duration(-1), ttl)
+
+	assert.NoError(t, batch.Commit())
+	db2 := reopenDB(t, options, db)
+	defer destroyDB(db2)
+	ttl, err = db2.TTL([]byte("ttl-key"))
+	assert.NoError(t, err)
+	assert.True(t, ttl > 0 && ttl <= time.Hour)
+	val, err = db2.Get([]byte("plain"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("p"), val)
+}
+
+func TestBatch_Savepoint_DeleteRebuild(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	batch := db.NewBatch(DefaultBatchOptions)
+	sp0, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("k"), []byte("v1")))
+
+	sp1, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Delete([]byte("k")))
+	_, err = batch.Get([]byte("k"))
+	assert.Equal(t, ErrKeyNotFound, err)
+
+	sp2, err := batch.Savepoint()
+	assert.NoError(t, err)
+	// rebuild the same key reuses the existing record in place
+	assert.NoError(t, batch.Put([]byte("k"), []byte("v2")))
+	val, err := batch.Get([]byte("k"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("v2"), val)
+
+	// back to the deleted state, then the pre-delete state, then pre-savepoint
+	assert.NoError(t, batch.RollbackTo(sp2))
+	_, err = batch.Get([]byte("k"))
+	assert.Equal(t, ErrKeyNotFound, err)
+	record := batch.lookupPendingWrites([]byte("k"))
+	assert.NotNil(t, record)
+	assert.Equal(t, LogRecordDeleted, record.Type)
+
+	assert.NoError(t, batch.RollbackTo(sp1))
+	val, err = batch.Get([]byte("k"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("v1"), val)
+
+	assert.NoError(t, batch.RollbackTo(sp0))
+	assert.Len(t, batch.pendingWrites, 0)
+	_, err = batch.Get([]byte("k"))
+	assert.Equal(t, ErrKeyNotFound, err)
+
+	// deleting an unknown key appends a tombstone record, also covered by undo
+	sp3, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Delete([]byte("ghost")))
+	assert.Len(t, batch.pendingWrites, 1)
+	assert.NoError(t, batch.RollbackTo(sp3))
+	assert.Len(t, batch.pendingWrites, 0)
+
+	assert.NoError(t, batch.Commit())
+	db2 := reopenDB(t, options, db)
+	defer destroyDB(db2)
+	assertKeyExistOrNot(t, db2, []byte("k"), false)
+	assertKeyExistOrNot(t, db2, []byte("ghost"), false)
+}
+
+func TestBatch_Savepoint_EmptyValue(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	batch := db.NewBatch(DefaultBatchOptions)
+	sp0, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("nil-key"), nil))
+	assert.NoError(t, batch.Put([]byte("empty-key"), []byte{}))
+
+	sp1, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("nil-key"), []byte("x")))
+	assert.NoError(t, batch.Put([]byte("empty-key"), []byte("y")))
+	assert.NoError(t, batch.RollbackTo(sp1))
+
+	val, err := batch.Get([]byte("nil-key"))
+	assert.NoError(t, err)
+	assert.Len(t, val, 0)
+	val, err = batch.Get([]byte("empty-key"))
+	assert.NoError(t, err)
+	assert.Len(t, val, 0)
+
+	assert.NoError(t, batch.RollbackTo(sp0))
+	assert.Len(t, batch.pendingWrites, 0)
+	assert.Len(t, batch.undoRefCount, 0)
+
+	// commit the empty values for real on the same batch and verify after reopen
+	assert.NoError(t, batch.Put([]byte("nil-key"), nil))
+	assert.NoError(t, batch.Put([]byte("empty-key"), []byte{}))
+	assert.NoError(t, batch.Commit())
+
+	db2 := reopenDB(t, options, db)
+	defer destroyDB(db2)
+	val, err = db2.Get([]byte("nil-key"))
+	assert.NoError(t, err)
+	assert.Len(t, val, 0)
+	val, err = db2.Get([]byte("empty-key"))
+	assert.NoError(t, err)
+	assert.Len(t, val, 0)
+}
+
+func TestBatch_Savepoint_PoolReuse(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	batch := db.NewBatch(DefaultBatchOptions)
+	sp0, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("outer"), []byte("o")))
+
+	sp1, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("inner"), []byte("i")))
+	innerRecord := batch.lookupPendingWrites([]byte("inner"))
+
+	assert.NoError(t, batch.RollbackTo(sp1))
+	// the removed record has no surviving undo reference, so it is poolable
+	_, referenced := batch.undoRefCount[innerRecord]
+	assert.False(t, referenced)
+
+	// a subsequent put may reuse the pooled struct without resurrecting old data
+	assert.NoError(t, batch.Put([]byte("reused"), []byte("r")))
+	val, err := batch.Get([]byte("reused"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("r"), val)
+	_, err = batch.Get([]byte("inner"))
+	assert.Equal(t, ErrKeyNotFound, err)
+
+	// the outer savepoint still restores its own record safely
+	assert.NoError(t, batch.RollbackTo(sp0))
+	assert.Len(t, batch.pendingWrites, 0)
+	assert.Len(t, batch.undoRefCount, 0)
+	assert.NoError(t, batch.Commit())
+
+	// while an outer savepoint still needs a record, releasing the inner one
+	// must not make the record available for pool reuse
+	batch2 := db.NewBatch(DefaultBatchOptions)
+	s0, err := batch2.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch2.Put([]byte("k"), []byte("v1")))
+	s1, err := batch2.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch2.Put([]byte("k"), []byte("v2")))
+	assert.NoError(t, batch2.ReleaseSavepoint(s1))
+	assert.Len(t, batch2.undoRefCount, 1)
+	assert.NoError(t, batch2.RollbackTo(s0))
+	assert.Len(t, batch2.pendingWrites, 0)
+	assert.Len(t, batch2.undoRefCount, 0)
+	assert.NoError(t, batch2.Commit())
+}
+
+func TestBatch_Savepoint_CommitReopenAndWatch(t *testing.T) {
+	options := DefaultOptions
+	options.WatchQueueSize = 100
+	db, err := Open(options)
+	assert.NoError(t, err)
+
+	watchCh, err := db.Watch()
+	assert.NoError(t, err)
+
+	batch := db.NewBatch(DefaultBatchOptions)
+	sp0, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("keep"), []byte("k")))
+
+	sp1, err := batch.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, batch.Put([]byte("drop"), []byte("d")))
+	assert.NoError(t, batch.Put([]byte("keep"), []byte("overwritten")))
+	assert.NoError(t, batch.RollbackTo(sp1))
+	// the outer savepoint stays valid after the inner rollback
+	assert.NoError(t, batch.RollbackTo(sp0))
+	assert.NoError(t, batch.Put([]byte("keep"), []byte("k")))
+
+	assert.NoError(t, batch.Put([]byte("added"), []byte("a")))
+	assert.NoError(t, batch.Commit())
+
+	// only the retained records may produce watch events; drain until idle
+	events := make(map[string][]byte)
+	idle := time.NewTimer(300 * time.Millisecond)
+	for {
+		select {
+		case event := <-watchCh:
+			events[string(event.Key)] = event.Value
+			idle.Reset(300 * time.Millisecond)
+		case <-idle.C:
+			assert.Len(t, events, 2)
+			assert.Equal(t, []byte("k"), events["keep"])
+			assert.Equal(t, []byte("a"), events["added"])
+			_, dropped := events["drop"]
+			assert.False(t, dropped)
+			db2 := reopenDB(t, options, db)
+			defer destroyDB(db2)
+			val, err := db2.Get([]byte("keep"))
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("k"), val)
+			val, err = db2.Get([]byte("added"))
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("a"), val)
+			assertKeyExistOrNot(t, db2, []byte("drop"), false)
+			return
+		}
+	}
+}
+
+func TestBatch_Savepoint_InvalidToken(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	// a token issued by another batch instance (also after pool recycling) is rejected
+	b1 := db.NewBatch(DefaultBatchOptions)
+	token, err := b1.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, b1.Rollback())
+	b2 := db.NewBatch(DefaultBatchOptions)
+	assert.Equal(t, ErrInvalidSavepoint, b2.RollbackTo(token))
+	assert.Equal(t, ErrInvalidSavepoint, b2.ReleaseSavepoint(token))
+	assert.NoError(t, b2.Rollback())
+
+	// the zero value token is never valid
+	b3 := db.NewBatch(DefaultBatchOptions)
+	assert.Equal(t, ErrInvalidSavepoint, b3.RollbackTo(SavepointToken{}))
+	assert.Equal(t, ErrInvalidSavepoint, b3.ReleaseSavepoint(SavepointToken{}))
+	assert.NoError(t, b3.Rollback())
+
+	// read-only batches cannot create savepoints
+	rb := db.NewBatch(BatchOptions{ReadOnly: true})
+	_, err = rb.Savepoint()
+	assert.Equal(t, ErrReadOnlyBatch, err)
+	assert.NoError(t, rb.Commit())
+
+	// tokens are rejected after the terminal commit state before any change
+	b4 := db.NewBatch(DefaultBatchOptions)
+	committedToken, err := b4.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, b4.Put([]byte("k"), []byte("v")))
+	assert.NoError(t, b4.Commit())
+	assert.Equal(t, ErrBatchCommitted, b4.RollbackTo(committedToken))
+	assert.Equal(t, ErrBatchCommitted, b4.ReleaseSavepoint(committedToken))
+
+	// tokens are rejected after the terminal rollback state
+	b5 := db.NewBatch(DefaultBatchOptions)
+	rollbackToken, err := b5.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, b5.Rollback())
+	assert.Equal(t, ErrBatchRollbacked, b5.RollbackTo(rollbackToken))
+	assert.Equal(t, ErrBatchRollbacked, b5.ReleaseSavepoint(rollbackToken))
+
+	// a released token cannot be rolled back to or released again
+	b6 := db.NewBatch(DefaultBatchOptions)
+	sp, err := b6.Savepoint()
+	assert.NoError(t, err)
+	assert.NoError(t, b6.ReleaseSavepoint(sp))
+	assert.Equal(t, ErrInvalidSavepoint, b6.RollbackTo(sp))
+	assert.Equal(t, ErrInvalidSavepoint, b6.ReleaseSavepoint(sp))
+	assert.NoError(t, b6.Rollback())
+}
+
+func TestBatch_Savepoint_CostNotLinear(t *testing.T) {
+	options := DefaultOptions
+	db, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db)
+
+	measureAllocs := func(pending int) float64 {
+		batch := db.NewBatch(DefaultBatchOptions)
+		for i := 0; i < pending; i++ {
+			assert.NoError(t, batch.Put(utils.GetTestKey(i), utils.RandomValue(32)))
+		}
+		allocs := testing.AllocsPerRun(20, func() {
+			sp, spErr := batch.Savepoint()
+			assert.NoError(t, spErr)
+			assert.NoError(t, batch.ReleaseSavepoint(sp))
+		})
+		assert.NoError(t, batch.Rollback())
+		return allocs
+	}
+
+	emptyAllocs := measureAllocs(0)
+	bigAllocs := measureAllocs(10000)
+	// identical allocation count regardless of pending size proves Savepoint
+	// does not walk or copy pendingWrites/pendingWritesMap
+	assert.Equal(t, emptyAllocs, bigAllocs)
+	t.Logf("allocs per savepoint/release cycle: empty=%v 10k-pending=%v", emptyAllocs, bigAllocs)
+
+	// timing sanity check: average cost stays in the same order of magnitude
+	measureLatency := func(pending int) time.Duration {
+		batch := db.NewBatch(DefaultBatchOptions)
+		for i := 0; i < pending; i++ {
+			assert.NoError(t, batch.Put(utils.GetTestKey(i), utils.RandomValue(32)))
+		}
+		start := time.Now()
+		for i := 0; i < 200; i++ {
+			sp, spErr := batch.Savepoint()
+			assert.NoError(t, spErr)
+			assert.NoError(t, batch.ReleaseSavepoint(sp))
+		}
+		latency := time.Since(start) / 200
+		assert.NoError(t, batch.Rollback())
+		return latency
+	}
+	t.Logf("latency per savepoint/release cycle: 100-pending=%v 20k-pending=%v",
+		measureLatency(100), measureLatency(20000))
+}
